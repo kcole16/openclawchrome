@@ -1,0 +1,42 @@
+{
+  "manifest_version": 3,
+  "name": "OpenClaw Enhanced Browser Relay",
+  "version": "1.0.0",
+  "description": "Enhanced browser relay with visual interaction, accessibility tree, and secure iframe support.",
+  "permissions": [
+    "debugger",
+    "tabs",
+    "activeTab",
+    "storage",
+    "scripting",
+    "webNavigation",
+    "webRequest"
+  ],
+  "host_permissions": [
+    "http://127.0.0.1/*",
+    "http://localhost/*",
+    "<all_urls>"
+  ],
+  "background": {
+    "service_worker": "background.js",
+    "type": "module"
+  },
+  "content_scripts": [
+    {
+      "matches": ["<all_urls>"],
+      "js": ["content.js"],
+      "run_at": "document_start",
+      "all_frames": true
+    }
+  ],
+  "action": {
+    "default_title": "OpenClaw Enhanced Relay (click to attach/detach)"
+  },
+  "options_ui": {
+    "page": "options.html",
+    "open_in_tab": true
+  },
+  "externally_connectable": {
+    "matches": ["http://localhost/*", "http://127.0.0.1/*"]
+  }
+}

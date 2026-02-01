@@ -1,0 +1,40 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>Browser Relay Options</title>
+  <style>
+    body { font-family: system-ui; padding: 20px; max-width: 520px; }
+    .field { margin: 15px 0; }
+    label { display: block; margin-bottom: 5px; font-weight: 500; }
+    input { padding: 8px; width: 100%; box-sizing: border-box; }
+    .status { padding: 10px; border-radius: 4px; margin: 15px 0; }
+    .status.ok { background: #d4edda; color: #155724; }
+    .status.error { background: #f8d7da; color: #721c24; }
+    button { padding: 10px 20px; cursor: pointer; }
+    code { background: #f2f2f2; padding: 0 4px; border-radius: 3px; }
+  </style>
+</head>
+<body>
+  <h1>Browser Relay Options</h1>
+
+  <div class="field">
+    <label for="port">Relay Port</label>
+    <input type="number" id="port" value="18792" min="1" max="65535">
+  </div>
+
+  <div id="status" class="status"></div>
+
+  <button id="save">Save &amp; Test Connection</button>
+
+  <h2>Setup Instructions</h2>
+  <ol>
+    <li>Ensure the relay server is running (default: <code>http://127.0.0.1:18792</code>)</li>
+    <li>Click the extension icon on any tab to attach</li>
+    <li>Badge shows <b>ON</b> when attached</li>
+    <li>Click again to detach</li>
+  </ol>
+
+  <script src="options.js"></script>
+</body>
+</html>
