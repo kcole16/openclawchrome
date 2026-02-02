@@ -279,6 +279,29 @@ async function detachTab(tabId, reason) {
   setBadge(tabId, 'off');
 }
 
+function cleanupTabState(tabId) {
+  const tab = tabs.get(tabId);
+
+  if (tab?.sessionId && tab?.targetId) {
+    try {
+      sendToRelay({
+        method: 'forwardCDPEvent',
+        params: {
+          method: 'Target.detachedFromTarget',
+          params: { sessionId: tab.sessionId, targetId: tab.targetId, reason: 'detached' }
+        }
+      });
+    } catch {}
+  }
+
+  if (tab?.sessionId) tabBySession.delete(tab.sessionId);
+  tabs.delete(tabId);
+
+  for (const [childId, parentId] of childSessionToTab.entries()) {
+    if (parentId === tabId) childSessionToTab.delete(childId);
+  }
+}
+
 function scheduleReattach(tabId) {
   if (reattachTimers.has(tabId)) return;
   if (!relayWs || relayWs.readyState !== WebSocket.OPEN) return;
@@ -330,13 +353,21 @@ function onDebuggerEvent(source, method, params) {
 
 function onDebuggerDetach(source, reason) {
   const tabId = source.tabId;
-  if (tabId && tabs.has(tabId)) {
-    const wasInitiated = detachInitiated.has(tabId);
-    detachTab(tabId, reason);
-    if (reason !== 'toggle' && !wasInitiated) {
-      scheduleReattach(tabId);
+  if (!tabId) return;
+
+  const wasInitiated = detachInitiated.has(tabId);
+
+  if (reason === 'toggle' || wasInitiated) {
+    if (tabs.has(tabId)) {
+      detachTab(tabId, reason);
     }
+    return;
   }
+
+  cleanupTabState(tabId);
+  setBadge(tabId, relayWs && relayWs.readyState === WebSocket.OPEN ? 'connecting' : 'off');
+  console.warn('Debugger detached, attempting reattach:', reason);
+  scheduleReattach(tabId);
 }
 
 async function connectOrToggleForActiveTab() {
