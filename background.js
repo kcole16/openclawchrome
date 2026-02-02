@@ -18,6 +18,7 @@ const tabs = new Map();
 const tabBySession = new Map();
 const childSessionToTab = new Map();
 const pending = new Map();
+const stableSessionByTab = new Map();
 const detachInitiated = new Set();
 const reattachTimers = new Map();
 const reattachAttempts = new Map();
@@ -100,6 +101,7 @@ function onRelayClosed(reason) {
   tabs.clear();
   tabBySession.clear();
   childSessionToTab.clear();
+  stableSessionByTab.clear();
 }
 
 async function onRelayMessage(text) {
@@ -222,7 +224,8 @@ async function attachTab(tabId, opts = {}) {
 
   if (!targetId) throw new Error('No targetId returned');
 
-  const sessionId = `cb-tab-${nextSession++}`;
+  const sessionId = stableSessionByTab.get(tabId) || `cb-tab-${nextSession++}`;
+  stableSessionByTab.set(tabId, sessionId);
 
   tabs.set(tabId, { state: 'connected', sessionId, targetId, attachOrder: nextSession });
   tabBySession.set(sessionId, tabId);
@@ -274,6 +277,9 @@ async function detachTab(tabId, reason) {
     if (parentId === tabId) childSessionToTab.delete(childId);
   }
 
+  if (reason === 'toggle') {
+    stableSessionByTab.delete(tabId);
+  }
   detachInitiated.add(tabId);
   try { await chrome.debugger.detach({ tabId }); } catch {}
   setBadge(tabId, 'off');
