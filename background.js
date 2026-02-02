@@ -18,6 +18,10 @@ const tabs = new Map();
 const tabBySession = new Map();
 const childSessionToTab = new Map();
 const pending = new Map();
+const detachInitiated = new Set();
+const reattachTimers = new Map();
+const reattachAttempts = new Map();
+const MAX_REATTACH_ATTEMPTS = 5;
 
 async function getRelayPort() {
   const stored = await chrome.storage.local.get(['relayPort']);
@@ -238,6 +242,13 @@ async function attachTab(tabId, opts = {}) {
   }
 
   setBadge(tabId, 'on');
+  detachInitiated.delete(tabId);
+  const timer = reattachTimers.get(tabId);
+  if (timer) {
+    clearTimeout(timer);
+    reattachTimers.delete(tabId);
+  }
+  reattachAttempts.delete(tabId);
   return { sessionId, targetId };
 }
 
@@ -263,8 +274,32 @@ async function detachTab(tabId, reason) {
     if (parentId === tabId) childSessionToTab.delete(childId);
   }
 
+  detachInitiated.add(tabId);
   try { await chrome.debugger.detach({ tabId }); } catch {}
   setBadge(tabId, 'off');
+}
+
+function scheduleReattach(tabId) {
+  if (reattachTimers.has(tabId)) return;
+  if (!relayWs || relayWs.readyState !== WebSocket.OPEN) return;
+
+  const attempts = (reattachAttempts.get(tabId) || 0) + 1;
+  if (attempts > MAX_REATTACH_ATTEMPTS) return;
+  reattachAttempts.set(tabId, attempts);
+
+  const delay = Math.min(1000 * attempts, 5000);
+  const timer = setTimeout(async () => {
+    reattachTimers.delete(tabId);
+    try {
+      const tab = await chrome.tabs.get(tabId);
+      if (!tab) return;
+      await attachTab(tabId, { skipAttachedEvent: false });
+    } catch {
+      scheduleReattach(tabId);
+    }
+  }, delay);
+
+  reattachTimers.set(tabId, timer);
 }
 
 function onDebuggerEvent(source, method, params) {
@@ -296,7 +331,11 @@ function onDebuggerEvent(source, method, params) {
 function onDebuggerDetach(source, reason) {
   const tabId = source.tabId;
   if (tabId && tabs.has(tabId)) {
+    const wasInitiated = detachInitiated.has(tabId);
     detachTab(tabId, reason);
+    if (reason !== 'toggle' && !wasInitiated) {
+      scheduleReattach(tabId);
+    }
   }
 }
 
