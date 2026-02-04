@@ -13,6 +13,11 @@ let relayWs = null;
 let relayConnectPromise = null;
 let debuggerListenersInstalled = false;
 let nextSession = 1;
+let relayKeepaliveTimer = null;
+let relayReconnectTimer = null;
+let relayReconnectAttempts = 0;
+const relayEventBuffer = [];
+const MAX_RELAY_BUFFER = 500;
 
 const tabs = new Map();
 const tabBySession = new Map();
@@ -20,9 +25,9 @@ const childSessionToTab = new Map();
 const pending = new Map();
 const stableSessionByTab = new Map();
 const detachInitiated = new Set();
+const desiredAttached = new Set();
 const reattachTimers = new Map();
 const reattachAttempts = new Map();
-const MAX_REATTACH_ATTEMPTS = 5;
 
 async function getRelayPort() {
   const stored = await chrome.storage.local.get(['relayPort']);
@@ -38,8 +43,12 @@ function setBadge(tabId, kind) {
   chrome.action.setBadgeTextColor({ tabId, color: '#FFFFFF' }).catch(() => {});
 }
 
+function isRelayConnected() {
+  return relayWs && relayWs.readyState === WebSocket.OPEN;
+}
+
 async function ensureRelayConnection() {
-  if (relayWs && relayWs.readyState === WebSocket.OPEN) return;
+  if (isRelayConnected()) return;
   if (relayConnectPromise) return await relayConnectPromise;
 
   relayConnectPromise = (async () => {
@@ -63,6 +72,14 @@ async function ensureRelayConnection() {
     ws.onmessage = (e) => onRelayMessage(String(e.data));
     ws.onclose = () => onRelayClosed('closed');
     ws.onerror = () => onRelayClosed('error');
+    relayReconnectAttempts = 0;
+    if (relayReconnectTimer) {
+      clearTimeout(relayReconnectTimer);
+      relayReconnectTimer = null;
+    }
+    startRelayKeepalive();
+    await syncAttachedTabsToRelay();
+    flushRelayBuffer();
 
     if (!debuggerListenersInstalled) {
       debuggerListenersInstalled = true;
@@ -79,29 +96,80 @@ async function ensureRelayConnection() {
 }
 
 function sendToRelay(payload) {
-  if (!relayWs || relayWs.readyState !== WebSocket.OPEN) {
+  if (!isRelayConnected()) {
     throw new Error('Relay not connected');
   }
   relayWs.send(JSON.stringify(payload));
 }
 
+function safeSendToRelay(payload) {
+  try {
+    if (isRelayConnected()) {
+      sendToRelay(payload);
+      return true;
+    }
+  } catch {}
+  return false;
+}
+
+function bufferRelayEvent(payload) {
+  relayEventBuffer.push({ ts: Date.now(), payload });
+  if (relayEventBuffer.length > MAX_RELAY_BUFFER) {
+    relayEventBuffer.splice(0, relayEventBuffer.length - MAX_RELAY_BUFFER);
+  }
+}
+
+function flushRelayBuffer() {
+  if (!isRelayConnected() || relayEventBuffer.length === 0) return;
+  const snapshot = relayEventBuffer.splice(0, relayEventBuffer.length);
+  for (const entry of snapshot) {
+    try { sendToRelay(entry.payload); } catch {}
+  }
+}
+
+function startRelayKeepalive() {
+  if (relayKeepaliveTimer) return;
+  relayKeepaliveTimer = setInterval(() => {
+    safeSendToRelay({ method: 'ping', ts: Date.now() });
+  }, 20000);
+}
+
+function stopRelayKeepalive() {
+  if (!relayKeepaliveTimer) return;
+  clearInterval(relayKeepaliveTimer);
+  relayKeepaliveTimer = null;
+}
+
+function scheduleRelayReconnect() {
+  if (relayReconnectTimer) return;
+  const attempt = relayReconnectAttempts + 1;
+  relayReconnectAttempts = attempt;
+  const baseDelay = Math.min(1000 * Math.pow(2, Math.min(attempt, 6)), 30000);
+  const jitter = Math.floor(Math.random() * 500);
+  const delay = baseDelay + jitter;
+  relayReconnectTimer = setTimeout(async () => {
+    relayReconnectTimer = null;
+    try {
+      await ensureRelayConnection();
+    } catch {
+      scheduleRelayReconnect();
+    }
+  }, delay);
+}
+
 function onRelayClosed(reason) {
   relayWs = null;
+  stopRelayKeepalive();
 
   for (const [id, p] of pending.entries()) {
     pending.delete(id);
     p.reject(new Error(`Relay disconnected (${reason})`));
   }
 
-  for (const tabId of tabs.keys()) {
-    chrome.debugger.detach({ tabId }).catch(() => {});
+  for (const tabId of desiredAttached.values()) {
     setBadge(tabId, 'connecting');
   }
-
-  tabs.clear();
-  tabBySession.clear();
-  childSessionToTab.clear();
-  stableSessionByTab.clear();
+  scheduleRelayReconnect();
 }
 
 async function onRelayMessage(text) {
@@ -112,6 +180,7 @@ async function onRelayMessage(text) {
     try { sendToRelay({ method: 'pong' }); } catch {}
     return;
   }
+  if (msg?.method === 'pong') return;
 
   if (typeof msg?.id === 'number' && (msg.result !== undefined || msg.error !== undefined)) {
     const p = pending.get(msg.id);
@@ -229,9 +298,10 @@ async function attachTab(tabId, opts = {}) {
 
   tabs.set(tabId, { state: 'connected', sessionId, targetId, attachOrder: nextSession });
   tabBySession.set(sessionId, tabId);
+  desiredAttached.add(tabId);
 
   if (!opts.skipAttachedEvent) {
-    sendToRelay({
+    const payload = {
       method: 'forwardCDPEvent',
       params: {
         method: 'Target.attachedToTarget',
@@ -241,7 +311,8 @@ async function attachTab(tabId, opts = {}) {
           waitingForDebugger: false
         }
       }
-    });
+    };
+    if (!safeSendToRelay(payload)) bufferRelayEvent(payload);
   }
 
   setBadge(tabId, 'on');
@@ -260,13 +331,14 @@ async function detachTab(tabId, reason) {
 
   if (tab?.sessionId && tab?.targetId) {
     try {
-      sendToRelay({
+      const payload = {
         method: 'forwardCDPEvent',
         params: {
           method: 'Target.detachedFromTarget',
           params: { sessionId: tab.sessionId, targetId: tab.targetId, reason }
         }
-      });
+      };
+      if (!safeSendToRelay(payload)) bufferRelayEvent(payload);
     } catch {}
   }
 
@@ -279,6 +351,7 @@ async function detachTab(tabId, reason) {
 
   if (reason === 'toggle') {
     stableSessionByTab.delete(tabId);
+    desiredAttached.delete(tabId);
   }
   detachInitiated.add(tabId);
   try { await chrome.debugger.detach({ tabId }); } catch {}
@@ -290,13 +363,14 @@ function cleanupTabState(tabId) {
 
   if (tab?.sessionId && tab?.targetId) {
     try {
-      sendToRelay({
+      const payload = {
         method: 'forwardCDPEvent',
         params: {
           method: 'Target.detachedFromTarget',
           params: { sessionId: tab.sessionId, targetId: tab.targetId, reason: 'detached' }
         }
-      });
+      };
+      if (!safeSendToRelay(payload)) bufferRelayEvent(payload);
     } catch {}
   }
 
@@ -310,13 +384,14 @@ function cleanupTabState(tabId) {
 
 function scheduleReattach(tabId) {
   if (reattachTimers.has(tabId)) return;
-  if (!relayWs || relayWs.readyState !== WebSocket.OPEN) return;
+  if (!desiredAttached.has(tabId)) return;
 
   const attempts = (reattachAttempts.get(tabId) || 0) + 1;
-  if (attempts > MAX_REATTACH_ATTEMPTS) return;
   reattachAttempts.set(tabId, attempts);
 
-  const delay = Math.min(1000 * attempts, 5000);
+  const baseDelay = Math.min(1000 * Math.pow(2, Math.min(attempts, 6)), 30000);
+  const jitter = Math.floor(Math.random() * 500);
+  const delay = baseDelay + jitter;
   const timer = setTimeout(async () => {
     reattachTimers.delete(tabId);
     try {
@@ -346,14 +421,15 @@ function onDebuggerEvent(source, method, params) {
   }
 
   try {
-    sendToRelay({
+    const payload = {
       method: 'forwardCDPEvent',
       params: {
         sessionId: source.sessionId || tab.sessionId,
         method,
         params
       }
-    });
+    };
+    if (!safeSendToRelay(payload)) bufferRelayEvent(payload);
   } catch {}
 }
 
@@ -374,6 +450,38 @@ function onDebuggerDetach(source, reason) {
   setBadge(tabId, relayWs && relayWs.readyState === WebSocket.OPEN ? 'connecting' : 'off');
   console.warn('Debugger detached, attempting reattach:', reason);
   scheduleReattach(tabId);
+}
+
+async function sendAttachedForTab(tabId) {
+  const tab = tabs.get(tabId);
+  if (!tab?.sessionId) return;
+  const debuggee = { tabId };
+  const info = await chrome.debugger.sendCommand(debuggee, 'Target.getTargetInfo');
+  const targetInfo = info?.targetInfo;
+  if (!targetInfo) throw new Error('Missing target info');
+  const payload = {
+    method: 'forwardCDPEvent',
+    params: {
+      method: 'Target.attachedToTarget',
+      params: {
+        sessionId: tab.sessionId,
+        targetInfo: { ...targetInfo, attached: true },
+        waitingForDebugger: false
+      }
+    }
+  };
+  if (!safeSendToRelay(payload)) bufferRelayEvent(payload);
+}
+
+async function syncAttachedTabsToRelay() {
+  for (const tabId of tabs.keys()) {
+    try {
+      await sendAttachedForTab(tabId);
+      setBadge(tabId, 'on');
+    } catch {
+      scheduleReattach(tabId);
+    }
+  }
 }
 
 async function connectOrToggleForActiveTab() {
@@ -413,6 +521,19 @@ chrome.runtime.onMessage.addListener((msg, sender) => {
   if (msg.type === 'enhanced.network') {
     addNetworkLog(tabId, msg.payload);
   }
+});
+
+chrome.tabs.onRemoved.addListener((tabId) => {
+  desiredAttached.delete(tabId);
+  stableSessionByTab.delete(tabId);
+  cleanupTabState(tabId);
+});
+
+chrome.webNavigation.onCommitted.addListener((details) => {
+  const tabId = details.tabId;
+  if (!desiredAttached.has(tabId)) return;
+  if (tabs.has(tabId)) return;
+  scheduleReattach(tabId);
 });
 
 chrome.runtime.onInstalled.addListener(() => {
