@@ -243,7 +243,10 @@ async function handleForwardCdpCommand(msg) {
 
   if (method === 'Target.createTarget') {
     const url = params?.url || 'about:blank';
-    const tab = await chrome.tabs.create({ url, active: false });
+    const tab = await chrome.tabs.create({ url, active: true });
+    if (tab?.windowId) {
+      await chrome.windows.update(tab.windowId, { focused: true }).catch(() => {});
+    }
     await new Promise(r => setTimeout(r, 100));
     const attached = await attachTab(tab.id);
     return { targetId: attached.targetId };
