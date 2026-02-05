@@ -20,6 +20,9 @@ const relayEventBuffer = [];
 const MAX_RELAY_BUFFER = 500;
 let sessionHeartbeatTimer = null;
 const SESSION_HEARTBEAT_MS = 15000;
+const lastTabInfo = new Map();
+const pendingReplacements = new Map();
+const PENDING_REPLACE_TTL_MS = 10000;
 
 const tabs = new Map();
 const tabBySession = new Map();
@@ -162,6 +165,47 @@ function stopSessionHeartbeat() {
   if (!sessionHeartbeatTimer) return;
   clearInterval(sessionHeartbeatTimer);
   sessionHeartbeatTimer = null;
+}
+
+function recordTabInfo(tab) {
+  if (!tab || typeof tab.id !== 'number') return;
+  lastTabInfo.set(tab.id, {
+    url: tab.url || '',
+    windowId: tab.windowId,
+    index: tab.index,
+    ts: Date.now()
+  });
+}
+
+function urlsMatch(a, b) {
+  if (!a || !b) return false;
+  if (a === b) return true;
+  try {
+    const ua = new URL(a);
+    const ub = new URL(b);
+    return ua.origin === ub.origin;
+  } catch {
+    return false;
+  }
+}
+
+function maybeAttachPending(tab) {
+  if (!tab || typeof tab.id !== 'number') return;
+  const now = Date.now();
+  for (const [key, pending] of pendingReplacements.entries()) {
+    if (!pending) continue;
+    if (now - pending.ts > PENDING_REPLACE_TTL_MS) {
+      pendingReplacements.delete(key);
+      continue;
+    }
+    if (pending.windowId !== tab.windowId) continue;
+    const okUrl = !pending.url || !tab.url || urlsMatch(pending.url, tab.url);
+    if (!okUrl) continue;
+    pendingReplacements.delete(key);
+    desiredAttached.add(tab.id);
+    scheduleReattach(tab.id);
+    return;
+  }
 }
 
 function scheduleRelayReconnect() {
@@ -337,6 +381,9 @@ async function attachTab(tabId, opts = {}) {
 
   if (!targetId) throw new Error('No targetId returned');
 
+  const tabInfo = await chrome.tabs.get(tabId).catch(() => null);
+  if (tabInfo) recordTabInfo(tabInfo);
+
   const sessionId = stableSessionByTab.get(tabId) || `cb-tab-${nextSession++}`;
   stableSessionByTab.set(tabId, sessionId);
 
@@ -440,7 +487,10 @@ function scheduleReattach(tabId) {
     reattachTimers.delete(tabId);
     try {
       const tab = await chrome.tabs.get(tabId);
-      if (!tab) return;
+      if (!tab) {
+        scheduleReattach(tabId);
+        return;
+      }
       await attachTab(tabId, { skipAttachedEvent: false });
     } catch {
       scheduleReattach(tabId);
@@ -497,6 +547,14 @@ function onDebuggerDetach(source, reason) {
   cleanupTabState(tabId);
   setBadge(tabId, relayWs && relayWs.readyState === WebSocket.OPEN ? 'connecting' : 'off');
   console.warn('Debugger detached, attempting reattach:', reason);
+  if (String(reason).toLowerCase() === 'target_closed' && desiredAttached.has(tabId)) {
+    const info = lastTabInfo.get(tabId);
+    pendingReplacements.set(`detach:${tabId}:${Date.now()}`, {
+      url: info?.url || '',
+      windowId: info?.windowId,
+      ts: Date.now()
+    });
+  }
   scheduleReattach(tabId);
 }
 
@@ -572,8 +630,17 @@ chrome.runtime.onMessage.addListener((msg, sender) => {
 });
 
 chrome.tabs.onRemoved.addListener((tabId) => {
+  if (desiredAttached.has(tabId)) {
+    const info = lastTabInfo.get(tabId);
+    pendingReplacements.set(`removed:${tabId}:${Date.now()}`, {
+      url: info?.url || '',
+      windowId: info?.windowId,
+      ts: Date.now()
+    });
+  }
   desiredAttached.delete(tabId);
   stableSessionByTab.delete(tabId);
+  lastTabInfo.delete(tabId);
   cleanupTabState(tabId);
 });
 
@@ -581,11 +648,24 @@ chrome.tabs.onReplaced.addListener((addedTabId, removedTabId) => {
   const shouldAttach = desiredAttached.has(removedTabId);
   desiredAttached.delete(removedTabId);
   stableSessionByTab.delete(removedTabId);
+  lastTabInfo.delete(removedTabId);
   cleanupTabState(removedTabId);
 
   if (shouldAttach) {
     desiredAttached.add(addedTabId);
     scheduleReattach(addedTabId);
+  }
+});
+
+chrome.tabs.onCreated.addListener((tab) => {
+  recordTabInfo(tab);
+  maybeAttachPending(tab);
+});
+
+chrome.tabs.onUpdated.addListener((tabId, changeInfo, tab) => {
+  if (changeInfo.url || changeInfo.status) {
+    recordTabInfo(tab);
+    maybeAttachPending(tab);
   }
 });
 
