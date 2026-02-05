@@ -23,6 +23,7 @@ const SESSION_HEARTBEAT_MS = 15000;
 const lastTabInfo = new Map();
 const pendingReplacements = new Map();
 const PENDING_REPLACE_TTL_MS = 10000;
+const DEBUG_RECOVERY = true;
 
 const tabs = new Map();
 const tabBySession = new Map();
@@ -201,10 +202,46 @@ function maybeAttachPending(tab) {
     if (pending.windowId !== tab.windowId) continue;
     const okUrl = !pending.url || !tab.url || urlsMatch(pending.url, tab.url);
     if (!okUrl) continue;
+    if (DEBUG_RECOVERY) {
+      console.log('Recovering from pending replacement', { key, pending, tabId: tab.id, tabUrl: tab.url });
+    }
     pendingReplacements.delete(key);
     desiredAttached.add(tab.id);
     scheduleReattach(tab.id);
     return;
+  }
+}
+
+async function recoverAfterTargetClosed(tabId, reason) {
+  const info = lastTabInfo.get(tabId);
+  if (!info?.windowId) return;
+
+  if (DEBUG_RECOVERY) {
+    console.log('Recover target_closed', { tabId, reason, info });
+  }
+
+  const active = await chrome.tabs.query({ active: true, windowId: info.windowId }).catch(() => []);
+  if (active && active[0]) {
+    const tab = active[0];
+    if (DEBUG_RECOVERY) {
+      console.log('Trying active tab recovery', { tabId: tab.id, tabUrl: tab.url });
+    }
+    if (!desiredAttached.has(tab.id)) desiredAttached.add(tab.id);
+    scheduleReattach(tab.id);
+    return;
+  }
+
+  const all = await chrome.tabs.query({ windowId: info.windowId }).catch(() => []);
+  for (const tab of all) {
+    if (!tab || typeof tab.id !== 'number') continue;
+    if (!info.url || !tab.url || urlsMatch(info.url, tab.url)) {
+      if (DEBUG_RECOVERY) {
+        console.log('Trying window tab recovery', { tabId: tab.id, tabUrl: tab.url });
+      }
+      if (!desiredAttached.has(tab.id)) desiredAttached.add(tab.id);
+      scheduleReattach(tab.id);
+      return;
+    }
   }
 }
 
@@ -554,6 +591,7 @@ function onDebuggerDetach(source, reason) {
       windowId: info?.windowId,
       ts: Date.now()
     });
+    recoverAfterTargetClosed(tabId, reason).catch(() => {});
   }
   scheduleReattach(tabId);
 }
@@ -652,6 +690,9 @@ chrome.tabs.onReplaced.addListener((addedTabId, removedTabId) => {
   cleanupTabState(removedTabId);
 
   if (shouldAttach) {
+    if (DEBUG_RECOVERY) {
+      console.log('tabs.onReplaced detected', { addedTabId, removedTabId });
+    }
     desiredAttached.add(addedTabId);
     scheduleReattach(addedTabId);
   }
