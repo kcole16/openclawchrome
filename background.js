@@ -409,7 +409,14 @@ async function handleForwardCdpCommand(msg) {
 async function attachTab(tabId, opts = {}) {
   const debuggee = { tabId };
 
-  await chrome.debugger.attach(debuggee, '1.3');
+  try {
+    await chrome.debugger.attach(debuggee, '1.3');
+  } catch (err) {
+    if (DEBUG_RECOVERY) {
+      console.warn('attachTab: debugger.attach failed', { tabId, err: err?.message || err });
+    }
+    throw err;
+  }
   await chrome.debugger.sendCommand(debuggee, 'Page.enable').catch(() => {});
 
   const info = await chrome.debugger.sendCommand(debuggee, 'Target.getTargetInfo');
@@ -525,11 +532,20 @@ function scheduleReattach(tabId) {
     try {
       const tab = await chrome.tabs.get(tabId);
       if (!tab) {
+        if (DEBUG_RECOVERY) {
+          console.warn('Reattach: chrome.tabs.get returned null', { tabId });
+        }
         scheduleReattach(tabId);
         return;
       }
+      if (DEBUG_RECOVERY) {
+        console.log('Reattach: attempting attach', { tabId, url: tab.url, status: tab.status });
+      }
       await attachTab(tabId, { skipAttachedEvent: false });
-    } catch {
+    } catch (err) {
+      if (DEBUG_RECOVERY) {
+        console.warn('Reattach: attachTab failed', { tabId, err: err?.message || err });
+      }
       scheduleReattach(tabId);
     }
   }, delay);
