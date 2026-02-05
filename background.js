@@ -18,6 +18,8 @@ let relayReconnectTimer = null;
 let relayReconnectAttempts = 0;
 const relayEventBuffer = [];
 const MAX_RELAY_BUFFER = 500;
+let sessionHeartbeatTimer = null;
+const SESSION_HEARTBEAT_MS = 15000;
 
 const tabs = new Map();
 const tabBySession = new Map();
@@ -140,6 +142,28 @@ function stopRelayKeepalive() {
   relayKeepaliveTimer = null;
 }
 
+function startSessionHeartbeat() {
+  if (sessionHeartbeatTimer) return;
+  sessionHeartbeatTimer = setInterval(async () => {
+    for (const [tabId] of tabs.entries()) {
+      if (!desiredAttached.has(tabId)) continue;
+      try {
+        await chrome.debugger.sendCommand({ tabId }, 'Target.getTargetInfo');
+      } catch (err) {
+        console.warn('Heartbeat failed, scheduling reattach:', tabId, err?.message || err);
+        cleanupTabState(tabId);
+        scheduleReattach(tabId);
+      }
+    }
+  }, SESSION_HEARTBEAT_MS);
+}
+
+function stopSessionHeartbeat() {
+  if (!sessionHeartbeatTimer) return;
+  clearInterval(sessionHeartbeatTimer);
+  sessionHeartbeatTimer = null;
+}
+
 function scheduleRelayReconnect() {
   if (relayReconnectTimer) return;
   const attempt = relayReconnectAttempts + 1;
@@ -228,6 +252,13 @@ async function handleForwardCdpCommand(msg) {
   if (!tabId) throw new Error(`No attached tab for ${method}`);
 
   const debuggee = { tabId };
+  const markStaleAndReattach = (err) => {
+    const message = String(err?.message || err || '');
+    if (/no target|session|target closed|detached|not found|inspected target/i.test(message)) {
+      cleanupTabState(tabId);
+      scheduleReattach(tabId);
+    }
+  };
 
   if (method.startsWith('Enhanced.')) {
     return await handleEnhancedCommand({ tabId, method, params });
@@ -238,7 +269,12 @@ async function handleForwardCdpCommand(msg) {
       await chrome.debugger.sendCommand(debuggee, 'Runtime.disable');
       await new Promise(r => setTimeout(r, 50));
     } catch {}
-    return await chrome.debugger.sendCommand(debuggee, 'Runtime.enable', params);
+    try {
+      return await chrome.debugger.sendCommand(debuggee, 'Runtime.enable', params);
+    } catch (err) {
+      markStaleAndReattach(err);
+      throw err;
+    }
   }
 
   if (method === 'Target.createTarget') {
@@ -281,7 +317,12 @@ async function handleForwardCdpCommand(msg) {
     ? { ...debuggee, sessionId }
     : debuggee;
 
-  return await chrome.debugger.sendCommand(debuggerSession, method, params);
+  try {
+    return await chrome.debugger.sendCommand(debuggerSession, method, params);
+  } catch (err) {
+    markStaleAndReattach(err);
+    throw err;
+  }
 }
 
 async function attachTab(tabId, opts = {}) {
@@ -422,6 +463,10 @@ function onDebuggerEvent(source, method, params) {
   if (method === 'Target.detachedFromTarget' && params?.sessionId) {
     childSessionToTab.delete(String(params.sessionId));
   }
+  if (method === 'Target.targetDestroyed' || method === 'Target.targetCrashed') {
+    cleanupTabState(tabId);
+    scheduleReattach(tabId);
+  }
 
   try {
     const payload = {
@@ -532,6 +577,18 @@ chrome.tabs.onRemoved.addListener((tabId) => {
   cleanupTabState(tabId);
 });
 
+chrome.tabs.onReplaced.addListener((addedTabId, removedTabId) => {
+  const shouldAttach = desiredAttached.has(removedTabId);
+  desiredAttached.delete(removedTabId);
+  stableSessionByTab.delete(removedTabId);
+  cleanupTabState(removedTabId);
+
+  if (shouldAttach) {
+    desiredAttached.add(addedTabId);
+    scheduleReattach(addedTabId);
+  }
+});
+
 chrome.webNavigation.onCommitted.addListener((details) => {
   const tabId = details.tabId;
   if (!desiredAttached.has(tabId)) return;
@@ -542,3 +599,5 @@ chrome.webNavigation.onCommitted.addListener((details) => {
 chrome.runtime.onInstalled.addListener(() => {
   chrome.runtime.openOptionsPage();
 });
+
+startSessionHeartbeat();
